@@ -27,6 +27,10 @@ export default defineConfig({
   build: {
     outDir: path.resolve(import.meta.dirname, "dist/public"),
     emptyOutDir: true,
+    // Додаємо налаштування для esbuild
+    esbuild: {
+      target: 'node14' // або 'node16', залежно від того, яка версія Node.js підтримується в твоєму середовищі
+    }
   },
   server: {
     fs: {
