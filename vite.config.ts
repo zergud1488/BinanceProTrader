@@ -34,4 +34,11 @@ export default defineConfig({
       deny: ["**/.*"],
     },
   },
+  optimizeDeps: {
+    esbuildOptions: {
+      define: {
+        'globalThis.crypto': 'require("crypto")', // Додаємо поліфіл для crypto
+      },
+    },
+  },
 });
