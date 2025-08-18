@@ -4,8 +4,8 @@
   "type": "module",
   "license": "MIT",
   "engines": {
-  "node": "16.x"
-  }
+    "node": "16.x"
+  },
   "scripts": {
     "start": "NODE_ENV=production node dist/index.js",
     "dev": "NODE_ENV=development tsx server/index.ts",
