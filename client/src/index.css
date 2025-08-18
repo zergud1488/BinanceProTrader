@@ -1,0 +1,170 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: hsl(216 14% 10%);
+  --foreground: hsl(0 0% 100%);
+  --card: hsl(213 12% 13%);
+  --card-foreground: hsl(0 0% 100%);
+  --popover: hsl(213 12% 13%);
+  --popover-foreground: hsl(0 0% 100%);
+  --primary: hsl(46 100% 50%);
+  --primary-foreground: hsl(216 14% 10%);
+  --secondary: hsl(213 12% 13%);
+  --secondary-foreground: hsl(0 0% 100%);
+  --muted: hsl(217 10% 20%);
+  --muted-foreground: hsl(215 8% 52%);
+  --accent: hsl(217 10% 20%);
+  --accent-foreground: hsl(0 0% 100%);
+  --destructive: hsl(351 89% 65%);
+  --destructive-foreground: hsl(0 0% 100%);
+  --border: hsl(217 8% 17%);
+  --input: hsl(216 14% 10%);
+  --ring: hsl(46 100% 50%);
+  --chart-1: hsl(46 100% 50%);
+  --chart-2: hsl(159 100% 36%);
+  --chart-3: hsl(42 93% 56%);
+  --chart-4: hsl(147 79% 42%);
+  --chart-5: hsl(341 75% 51%);
+  --sidebar: hsl(213 12% 13%);
+  --sidebar-foreground: hsl(0 0% 100%);
+  --sidebar-primary: hsl(46 100% 50%);
+  --sidebar-primary-foreground: hsl(216 14% 10%);
+  --sidebar-accent: hsl(217 10% 20%);
+  --sidebar-accent-foreground: hsl(0 0% 100%);
+  --sidebar-border: hsl(217 8% 17%);
+  --sidebar-ring: hsl(46 100% 50%);
+  --font-sans: Inter, sans-serif;
+  --font-serif: Georgia, serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  --radius: 0.5rem;
+  --binance-bg: hsl(216 14% 10%);
+  --binance-card: hsl(213 12% 13%);
+  --binance-yellow: hsl(46 100% 50%);
+  --binance-yellow-hover: hsl(43 100% 45%);
+  --binance-border: hsl(217 8% 17%);
+  --binance-text: hsl(0 0% 100%);
+  --binance-text-muted: hsl(215 8% 52%);
+  --binance-success: hsl(159 100% 36%);
+  --binance-error: hsl(351 89% 65%);
+}
+
+.dark {
+  --background: hsl(216 14% 10%);
+  --foreground: hsl(0 0% 100%);
+  --card: hsl(213 12% 13%);
+  --card-foreground: hsl(0 0% 100%);
+  --popover: hsl(213 12% 13%);
+  --popover-foreground: hsl(0 0% 100%);
+  --primary: hsl(46 100% 50%);
+  --primary-foreground: hsl(216 14% 10%);
+  --secondary: hsl(213 12% 13%);
+  --secondary-foreground: hsl(0 0% 100%);
+  --muted: hsl(217 10% 20%);
+  --muted-foreground: hsl(215 8% 52%);
+  --accent: hsl(217 10% 20%);
+  --accent-foreground: hsl(0 0% 100%);
+  --destructive: hsl(351 89% 65%);
+  --destructive-foreground: hsl(0 0% 100%);
+  --border: hsl(217 8% 17%);
+  --input: hsl(216 14% 10%);
+  --ring: hsl(46 100% 50%);
+  --chart-1: hsl(46 100% 50%);
+  --chart-2: hsl(159 100% 36%);
+  --chart-3: hsl(42 93% 56%);
+  --chart-4: hsl(147 79% 42%);
+  --chart-5: hsl(341 75% 51%);
+  --sidebar: hsl(213 12% 13%);
+  --sidebar-foreground: hsl(0 0% 100%);
+  --sidebar-primary: hsl(46 100% 50%);
+  --sidebar-primary-foreground: hsl(216 14% 10%);
+  --sidebar-accent: hsl(217 10% 20%);
+  --sidebar-accent-foreground: hsl(0 0% 100%);
+  --sidebar-border: hsl(217 8% 17%);
+  --sidebar-ring: hsl(46 100% 50%);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply font-sans antialiased;
+    background-color: var(--binance-bg);
+    color: var(--binance-text);
+  }
+}
+
+.bg-binance-bg {
+  background-color: var(--binance-bg);
+}
+
+.bg-binance-card {
+  background-color: var(--binance-card);
+}
+
+.bg-binance-yellow {
+  background-color: var(--binance-yellow);
+}
+
+.bg-binance-yellow-hover:hover {
+  background-color: var(--binance-yellow-hover);
+}
+
+.border-binance-border {
+  border-color: var(--binance-border);
+}
+
+.border-binance-yellow {
+  border-color: var(--binance-yellow);
+}
+
+.text-binance-text {
+  color: var(--binance-text);
+}
+
+.text-binance-text-muted {
+  color: var(--binance-text-muted);
+}
+
+.text-binance-yellow {
+  color: var(--binance-yellow);
+}
+
+.text-binance-bg {
+  color: var(--binance-bg);
+}
+
+.text-binance-success {
+  color: var(--binance-success);
+}
+
+.text-binance-error {
+  color: var(--binance-error);
+}
+
+.hover\:text-binance-yellow:hover {
+  color: var(--binance-yellow);
+}
+
+.hover\:text-binance-yellow-hover:hover {
+  color: var(--binance-yellow-hover);
+}
+
+.hover\:bg-binance-yellow:hover {
+  background-color: var(--binance-yellow);
+}
+
+.hover\:bg-binance-yellow-hover:hover {
+  background-color: var(--binance-yellow-hover);
+}
+
+.hover\:border-binance-yellow:hover {
+  border-color: var(--binance-yellow);
+}
+
+.focus\:border-binance-yellow:focus {
+  border-color: var(--binance-yellow);
+}
