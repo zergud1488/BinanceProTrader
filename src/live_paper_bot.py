@@ -336,11 +336,15 @@ class LiveMarketEngine:
     - Evaluates 100% causal features on strictly completed 1m candles.
     - Tracks BTC Dump Shield in real-time.
     """
-    def __init__(self, base_url: str = BINANCE_MAINNET_URL):
+    def __init__(self, base_url: str = BINANCE_MAINNET_URL, concurrency_limit: int = 25):
         self.base_url = base_url
+        self.concurrency_limit = concurrency_limit
         self._session: Optional[aiohttp.ClientSession] = None
+        self._sem: Optional[asyncio.Semaphore] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
+        if self._sem is None:
+            self._sem = asyncio.Semaphore(self.concurrency_limit)
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
             timeout = aiohttp.ClientTimeout(total=10)
@@ -357,12 +361,13 @@ class LiveMarketEngine:
 
     async def scan_inplay_candidates(self, min_vol_usd: float = 10_000_000.0, 
                                      min_range_pct: float = 3.5, 
-                                     top_n: int = 15) -> Dict[str, List[dict]]:
+                                     max_candidates: int = 100) -> Dict[str, List[dict]]:
         """
         Screens 725+ tickers from Binance Futures Mainnet in a single request.
-        Returns two distinct institutional pools:
+        Returns two distinct institutional pools (up to max_candidates total):
           - gainers: ranked by In-Play Long institutional score (change_24h >= +5.0%, volume, range)
           - dumpers: ranked by In-Play Short severity (change_24h <= -15.0%, volume, range)
+        Dynamic rebalancing fills unused slots from one side with high-potential coins from the other side.
         """
         url = f"{self.base_url}/fapi/v1/ticker/24hr"
         session = await self._get_session()
@@ -437,9 +442,22 @@ class LiveMarketEngine:
 
         scored_gainers.sort(key=lambda x: x["inplay_score"], reverse=True)
         scored_dumpers.sort(key=lambda x: x["inplay_score"], reverse=True)
+
+        half_limit = max_candidates // 2
+        top_gainers = scored_gainers[:half_limit]
+        top_dumpers = scored_dumpers[:half_limit]
+
+        # Dynamic slot rebalancing: if one bucket has fewer candidates, allocate remainder to the other side
+        rem = max_candidates - (len(top_gainers) + len(top_dumpers))
+        if rem > 0:
+            if len(scored_gainers) > len(top_gainers):
+                top_gainers = scored_gainers[:len(top_gainers) + rem]
+            elif len(scored_dumpers) > len(top_dumpers):
+                top_dumpers = scored_dumpers[:len(top_dumpers) + rem]
+
         return {
-            "gainers": scored_gainers[:top_n],
-            "dumpers": scored_dumpers[:top_n]
+            "gainers": top_gainers,
+            "dumpers": top_dumpers
         }
 
     async def check_btc_status(self) -> Tuple[int, float]:
@@ -482,14 +500,15 @@ class LiveMarketEngine:
         u_1h = f"{self.base_url}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=30"
 
         try:
-            r1, r15, r1h = await asyncio.gather(
-                session.get(u_1m), session.get(u_15m), session.get(u_1h)
-            )
-            if r1.status != 200 or r15.status != 200 or r1h.status != 200:
-                return None
-            k1 = await r1.json()
-            k15 = await r15.json()
-            k1h = await r1h.json()
+            async with self._sem:
+                r1, r15, r1h = await asyncio.gather(
+                    session.get(u_1m), session.get(u_15m), session.get(u_1h)
+                )
+                if r1.status != 200 or r15.status != 200 or r1h.status != 200:
+                    return None
+                k1 = await r1.json()
+                k15 = await r15.json()
+                k1h = await r1h.json()
         except Exception:
             return None
 
@@ -724,10 +743,12 @@ class LivePaperBot:
     def __init__(self, 
                  scan_interval_sec: int = 20, 
                  position_check_interval_sec: float = 2.5,
-                 max_hold_minutes: int = 15):
+                 max_hold_minutes: int = 15,
+                 scan_limit: int = 100):
         self.scan_interval = scan_interval_sec
         self.pos_check_interval = position_check_interval_sec
         self.max_hold_minutes = max_hold_minutes
+        self.scan_limit = scan_limit
         
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.portfolio = PaperPortfolio(
@@ -737,7 +758,7 @@ class LivePaperBot:
             max_concurrent_positions=3,
             friction_pct=0.0015
         )
-        self.market = LiveMarketEngine()
+        self.market = LiveMarketEngine(concurrency_limit=25)
         self.strategy = SMCStrategyEngine()
         
         self.is_running = False
@@ -754,7 +775,7 @@ class LivePaperBot:
         print("="*80)
         print("🚀 INITIALIZING AUTONOMOUS LIVE PAPER TRADING BOT (BINANCE MAINNET)")
         print(f"   Capital: ${self.portfolio.balance:.2f} | Leverage: {self.portfolio.leverage}x | Margin/Trade: ${self.portfolio.margin_per_trade:.2f}")
-        print(f"   Max Pos: {self.portfolio.max_positions} | Max Hold: {self.max_hold_minutes}m | Strategy: SMC (NO BE)")
+        print(f"   Max Pos: {self.portfolio.max_positions} | Max Hold: {self.max_hold_minutes}m | Scan Limit: {self.scan_limit} coins | Strategy: SMC (NO BE)")
         print(f"   Telegram Alerts: Chat ID {TELEGRAM_CHAT_ID} (YabkoShop_bot)")
         print("="*80)
 
@@ -1073,7 +1094,7 @@ class LivePaperBot:
         candidates_dict = await self.market.scan_inplay_candidates(
             min_vol_usd=10_000_000.0,
             min_range_pct=3.5,
-            top_n=15
+            max_candidates=self.scan_limit
         )
         gainers = candidates_dict.get("gainers", [])
         dumpers = candidates_dict.get("dumpers", [])
@@ -1242,13 +1263,15 @@ def main():
     parser.add_argument("--scan_interval", type=int, default=20, help="Market scan interval in seconds")
     parser.add_argument("--pos_interval", type=float, default=2.5, help="Position monitoring interval in seconds")
     parser.add_argument("--max_hold", type=int, default=15, help="Maximum position hold time in minutes")
+    parser.add_argument("--scan_limit", type=int, default=100, help="Maximum number of in-play coins to scan per cycle (default: 100)")
     parser.add_argument("--single_cycle", action="store_true", help="Run 1 monitoring cycle and exit (for verification)")
     args = parser.parse_args()
 
     bot = LivePaperBot(
         scan_interval_sec=args.scan_interval,
         position_check_interval_sec=args.pos_interval,
-        max_hold_minutes=args.max_hold
+        max_hold_minutes=args.max_hold,
+        scan_limit=args.scan_limit
     )
 
     loop = asyncio.new_event_loop()
