@@ -33,6 +33,9 @@ TELEGRAM_BOT_TOKEN = "6110538923:AAEVgH4IAftaG8nAFjDiFz0-FSqGu1Fbv_g"
 TELEGRAM_CHAT_ID = "669861467"
 BINANCE_MAINNET_URL = "https://fapi.binance.com"
 
+# Benchmark symbols used strictly for market regime & dump/pump shield (NEVER traded directly)
+EXCLUDE_TRADING_SYMBOLS = {"BTCUSDT", "ETHUSDT"}
+
 STATE_FILE = DATA_DIR / "live_paper_portfolio_state.json"
 TRADES_CSV = REPORTS_DIR / "live_paper_trades.csv"
 
@@ -360,14 +363,14 @@ class LiveMarketEngine:
             await self._session.close()
 
     async def scan_inplay_candidates(self, min_vol_usd: float = 10_000_000.0, 
-                                     min_range_pct: float = 3.5, 
+                                     min_range_pct: float = 5.0, 
                                      max_candidates: int = 100) -> Dict[str, List[dict]]:
         """
         Screens 725+ tickers from Binance Futures Mainnet in a single request.
         Returns two distinct institutional pools (up to max_candidates total):
           - gainers: ranked by In-Play Long institutional score (change_24h >= +5.0%, volume, range)
           - dumpers: ranked by In-Play Short severity (change_24h <= -15.0%, volume, range)
-        Dynamic rebalancing fills unused slots from one side with high-potential coins from the other side.
+        Excludes BTC/ETH benchmarks from active trading; dynamic rebalancing allocates remaining slots.
         """
         url = f"{self.base_url}/fapi/v1/ticker/24hr"
         session = await self._get_session()
@@ -391,7 +394,7 @@ class LiveMarketEngine:
 
         for t in tickers:
             sym = t.get("symbol", "")
-            if not sym.endswith("USDT") or "_" in sym:
+            if not sym.endswith("USDT") or "_" in sym or sym in EXCLUDE_TRADING_SYMBOLS:
                 continue
 
             try:
@@ -572,6 +575,11 @@ class LiveMarketEngine:
             tr_list.append(tr)
         atr_15_pct = (np.mean(tr_list[-15:]) / target_c * 100.0) if len(tr_list) >= 15 else 1.0
 
+        # Volatility Gate: Require True In-Play Volatility (ATR-15 >= 0.70%)
+        # Excludes heavy, low-beta coins where 1.2% TP is too far for 15-60m
+        if atr_15_pct < 0.70:
+            return {"symbol": symbol, "side": side_u, "skip": True}
+
         utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
 
         if side_u == "LONG":
@@ -743,7 +751,7 @@ class LivePaperBot:
     def __init__(self, 
                  scan_interval_sec: int = 20, 
                  position_check_interval_sec: float = 2.5,
-                 max_hold_minutes: int = 15,
+                 max_hold_minutes: int = 60,
                  scan_limit: int = 100):
         self.scan_interval = scan_interval_sec
         self.pos_check_interval = position_check_interval_sec
@@ -1262,7 +1270,7 @@ def main():
     parser = argparse.ArgumentParser(description="Autonomous Live Paper Trading Bot (Binance Futures Mainnet)")
     parser.add_argument("--scan_interval", type=int, default=20, help="Market scan interval in seconds")
     parser.add_argument("--pos_interval", type=float, default=2.5, help="Position monitoring interval in seconds")
-    parser.add_argument("--max_hold", type=int, default=15, help="Maximum position hold time in minutes")
+    parser.add_argument("--max_hold", type=int, default=60, help="Maximum position hold time in minutes (default: 60)")
     parser.add_argument("--scan_limit", type=int, default=100, help="Maximum number of in-play coins to scan per cycle (default: 100)")
     parser.add_argument("--single_cycle", action="store_true", help="Run 1 monitoring cycle and exit (for verification)")
     args = parser.parse_args()

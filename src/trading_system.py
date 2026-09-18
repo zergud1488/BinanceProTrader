@@ -61,6 +61,12 @@ class UnifiedTradingSystem:
         if row.get("trend_15m_bull", 0) != 1 or row.get("trend_1h_bull", 0) != 1:
             return False
 
+        # 4. Volatility Gate: Require True In-Play Volatility (ATR-15 >= 0.70%)
+        # Excludes heavy, low-beta coins (like BTC/ETH) where 1.2% TP is too far for 15-60m
+        atr_15 = row.get("atr_15_pct")
+        if atr_15 is not None and atr_15 < 0.70:
+            return False
+
         # 4. Climax Volume Exhaustion Filter (RVOL <= 5.5)
         # Avoid buying the euphoric blow-off top where market makers dump
         rvol = row.get("rvol_20")
@@ -122,6 +128,11 @@ class UnifiedTradingSystem:
 
         # 3. Macro Multi-Timeframe Alignment: 15m & 1h Bearish Trends
         if row.get("trend_15m_bull", 1) != 0 or row.get("trend_1h_bull", 1) != 0:
+            return False
+
+        # 4. Volatility Gate: Require True In-Play Volatility (ATR-15 >= 0.70%)
+        atr_15 = row.get("atr_15_pct")
+        if atr_15 is not None and atr_15 < 0.70:
             return False
 
         # 4. Volume Exhaustion Filter
