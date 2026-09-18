@@ -1,3 +1,1 @@
-web: npm run build && npm run start
-web: node dist/index.js
-web: npm start
+web: python -u src/live_paper_bot.py --scan_interval 20 --pos_interval 2.5 --max_hold 15

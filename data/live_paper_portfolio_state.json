@@ -1,0 +1,15 @@
+{
+  "starting_balance": 100.0,
+  "balance": 97.3749,
+  "peak_balance": 102.1,
+  "max_drawdown_pct": 4.63,
+  "margin_per_trade": 10.0,
+  "leverage": 20.0,
+  "max_positions": 3,
+  "total_trades": 3,
+  "wins": 1,
+  "losses": 2,
+  "win_rate_pct": 33.33,
+  "active_positions": {},
+  "last_updated": "2026-09-18 15:08:12"
+}

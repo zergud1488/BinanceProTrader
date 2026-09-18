@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: BinanceProTrader
+    runtime: python
+    region: frankfurt
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -u src/live_paper_bot.py --scan_interval 20 --pos_interval 2.5 --max_hold 15
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: PORT
+        value: 10000
