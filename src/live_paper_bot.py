@@ -333,7 +333,11 @@ class LiveMarketEngine:
         if self._session is None or self._session.closed:
             connector = aiohttp.TCPConnector(limit=60, ttl_dns_cache=300)
             timeout = aiohttp.ClientTimeout(total=10)
-            self._session = aiohttp.ClientSession(connector=connector, timeout=timeout)
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                "Accept": "application/json"
+            }
+            self._session = aiohttp.ClientSession(connector=connector, timeout=timeout, headers=headers)
         return self._session
 
     async def close(self):
@@ -353,7 +357,11 @@ class LiveMarketEngine:
         try:
             async with session.get(url) as resp:
                 if resp.status != 200:
-                    print(f"[!] Ticker fetch error HTTP {resp.status}")
+                    err_text = await resp.text()
+                    print(f"[!] Ticker fetch error HTTP {resp.status}: {err_text[:120]}")
+                    if resp.status in (418, 429):
+                        print("[!] Rate limit / IP ban encountered. Backing off for 30s to respect Binance cooldown...")
+                        await asyncio.sleep(30)
                     return []
                 tickers = await resp.json()
         except Exception as e:
@@ -666,6 +674,12 @@ class LivePaperBot:
         self.is_running = False
         self.start_time = time.time()
         self.last_heartbeat_time = time.time()
+        self.last_scan_info = {
+            "timestamp": None,
+            "candidates_count": 0,
+            "leaders": [],
+            "error": None
+        }
 
     async def initialize(self):
         print("="*80)
@@ -745,8 +759,37 @@ class LivePaperBot:
         async def handle_health(request):
             return web.json_response({"status": "ok", "balance": self.portfolio.balance})
 
+        async def handle_status(request):
+            egress_ip = "unknown"
+            binance_ping = "unknown"
+            try:
+                session = await self.market._get_session()
+                async with session.get("https://api.ipify.org?format=json", timeout=3) as r:
+                    if r.status == 200:
+                        egress_ip = (await r.json()).get("ip")
+            except Exception as e:
+                egress_ip = str(e)
+
+            try:
+                session = await self.market._get_session()
+                async with session.get(f"{self.market.base_url}/fapi/v1/ping", timeout=3) as r:
+                    binance_ping = f"HTTP {r.status}"
+            except Exception as e:
+                binance_ping = str(e)
+
+            return web.json_response({
+                "status": "ok",
+                "egress_ip": egress_ip,
+                "binance_ping": binance_ping,
+                "balance": self.portfolio.balance,
+                "active_positions": list(self.portfolio.active_positions.keys()),
+                "last_scan": self.last_scan_info,
+                "stats": self.portfolio.get_stats()
+            })
+
         app.router.add_get("/", handle_index)
         app.router.add_get("/health", handle_health)
+        app.router.add_get("/status", handle_status)
 
         try:
             runner = web.AppRunner(app)
@@ -929,7 +972,13 @@ class LivePaperBot:
             top_n=30
         )
         if not top_coins:
+            self.last_scan_info["error"] = "No candidates or Binance API rate-limit/ban (HTTP 418/429)"
             return
+
+        self.last_scan_info["timestamp"] = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
+        self.last_scan_info["candidates_count"] = len(top_coins)
+        self.last_scan_info["leaders"] = [c["symbol"] for c in top_coins[:6]]
+        self.last_scan_info["error"] = None
 
         # 2. BTC Dump Shield check
         btc_dump = await self.market.check_btc_dump_warning()
