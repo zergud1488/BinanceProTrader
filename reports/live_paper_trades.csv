@@ -1,0 +1,1 @@
+trade_id,symbol,side,entry_time,exit_time,duration_sec,entry_price,exit_price,margin_usd,leverage,notional_usd,exit_reason,price_change_pct,gross_pnl_usd,fee_usd,net_pnl_usd,roi_margin_pct,balance_after,win_rate_pct
