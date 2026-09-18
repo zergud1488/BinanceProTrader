@@ -154,14 +154,14 @@ class PaperPortfolio:
 
     def open_position(self, symbol: str, entry_price: float, sl_price: float, 
                       sl_pct: float, tp_price: float, tp_pct: float, 
-                      metrics: dict) -> dict:
+                      metrics: dict, side: str = "LONG") -> dict:
         notional = self.margin_per_trade * self.leverage
         now_ts = time.time()
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         pos_record = {
             "symbol": symbol,
-            "side": "LONG",
+            "side": str(side).upper(),
             "entry_time": now_ts,
             "entry_time_str": now_str,
             "entry_price": float(entry_price),
@@ -192,10 +192,16 @@ class PaperPortfolio:
         entry_p = pos["entry_price"]
         notional = pos["notional_usd"]
         margin = pos["margin_usd"]
+        side = pos.get("side", "LONG").upper()
 
-        # Long PnL Math
-        price_change_pct = (exit_price - entry_p) / entry_p * 100.0
-        gross_pnl = notional * ((exit_price - entry_p) / entry_p)
+        # Directional PnL Math
+        if side == "LONG":
+            price_change_pct = (exit_price - entry_p) / entry_p * 100.0
+            gross_pnl = notional * ((exit_price - entry_p) / entry_p)
+        else: # SHORT
+            price_change_pct = (entry_p - exit_price) / entry_p * 100.0
+            gross_pnl = notional * ((entry_p - exit_price) / entry_p)
+
         fee = notional * self.friction_pct
         net_pnl = gross_pnl - fee
         roi_margin_pct = (net_pnl / margin) * 100.0
@@ -351,10 +357,12 @@ class LiveMarketEngine:
 
     async def scan_inplay_candidates(self, min_vol_usd: float = 10_000_000.0, 
                                      min_range_pct: float = 3.5, 
-                                     top_n: int = 30) -> List[dict]:
+                                     top_n: int = 15) -> Dict[str, List[dict]]:
         """
         Screens 725+ tickers from Binance Futures Mainnet in a single request.
-        Ranks by In-Play institutional score (volatility + momentum + volume).
+        Returns two distinct institutional pools:
+          - gainers: ranked by In-Play Long institutional score (change_24h >= +5.0%, volume, range)
+          - dumpers: ranked by In-Play Short severity (change_24h <= -15.0%, volume, range)
         """
         url = f"{self.base_url}/fapi/v1/ticker/24hr"
         session = await self._get_session()
@@ -367,13 +375,15 @@ class LiveMarketEngine:
                     if resp.status in (418, 429):
                         print("[!] Rate limit / IP ban encountered. Backing off for 30s to respect Binance cooldown...")
                         await asyncio.sleep(30)
-                    return []
+                    return {"gainers": [], "dumpers": []}
                 tickers = await resp.json()
         except Exception as e:
             print(f"[!] Network error fetching 24hr tickers: {e}")
-            return []
+            return {"gainers": [], "dumpers": []}
 
-        scored = []
+        scored_gainers = []
+        scored_dumpers = []
+
         for t in tickers:
             sym = t.get("symbol", "")
             if not sym.endswith("USDT") or "_" in sym:
@@ -395,52 +405,73 @@ class LiveMarketEngine:
             if quote_vol < min_vol_usd or range_pct < min_range_pct:
                 continue
 
-            # In-Play Institutional Composite Score
-            vol_score = min(range_pct / 20.0, 3.0) * 45.0
-            mom_score = min(max(price_chg, 0.0) / 15.0, 3.0) * 35.0
-            liq_score = min(np.log10(quote_vol) / 10.0, 2.0) * 20.0
-            total_score = vol_score + mom_score + liq_score
+            # 1. Gainers bucket: change_24h_pct >= +5.0%
+            if price_chg >= 5.0:
+                vol_score = min(range_pct / 20.0, 3.0) * 45.0
+                mom_score = min(price_chg / 15.0, 3.0) * 35.0
+                liq_score = min(np.log10(quote_vol) / 10.0, 2.0) * 20.0
+                scored_gainers.append({
+                    "symbol": sym,
+                    "last_price": last_p,
+                    "change_24h_pct": price_chg,
+                    "range_24h_pct": range_pct,
+                    "volume_24h_usd": quote_vol,
+                    "inplay_score": vol_score + mom_score + liq_score,
+                    "side": "LONG"
+                })
 
-            scored.append({
-                "symbol": sym,
-                "last_price": last_p,
-                "change_24h_pct": price_chg,
-                "range_24h_pct": range_pct,
-                "volume_24h_usd": quote_vol,
-                "inplay_score": total_score
-            })
+            # 2. Dumpers bucket: change_24h_pct <= -15.0% (In-Play Dumpers for Short)
+            elif price_chg <= -15.0:
+                vol_score = min(range_pct / 20.0, 3.0) * 40.0
+                drop_score = min(abs(price_chg) / 15.0, 3.0) * 40.0
+                liq_score = min(np.log10(quote_vol) / 10.0, 2.0) * 20.0
+                scored_dumpers.append({
+                    "symbol": sym,
+                    "last_price": last_p,
+                    "change_24h_pct": price_chg,
+                    "range_24h_pct": range_pct,
+                    "volume_24h_usd": quote_vol,
+                    "inplay_score": vol_score + drop_score + liq_score,
+                    "side": "SHORT"
+                })
 
-        scored.sort(key=lambda x: x["inplay_score"], reverse=True)
-        return scored[:top_n]
+        scored_gainers.sort(key=lambda x: x["inplay_score"], reverse=True)
+        scored_dumpers.sort(key=lambda x: x["inplay_score"], reverse=True)
+        return {
+            "gainers": scored_gainers[:top_n],
+            "dumpers": scored_dumpers[:top_n]
+        }
 
-    async def check_btc_dump_warning(self) -> int:
+    async def check_btc_status(self) -> Tuple[int, float]:
         """
         Monitors BTCUSDT completed 1m candles.
-        Returns 1 if BTC dropped > 0.35% over last 3 completed minutes.
+        Returns:
+          - btc_dump_warning: 1 if BTC dropped > 0.35% over last 3 completed minutes
+          - btc_ret_15m: percentage return of BTC over last 15 completed minutes
         """
-        url = f"{self.base_url}/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=6"
+        url = f"{self.base_url}/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=20"
         session = await self._get_session()
         try:
             async with session.get(url) as resp:
                 if resp.status == 200:
                     klines = await resp.json()
-                    if len(klines) >= 4:
+                    if len(klines) >= 16:
                         curr_ms = int(time.time() * 1000)
-                        # Last completed candle
                         end_idx = -2 if curr_ms <= klines[-1][6] else -1
                         closes = [float(k[4]) for k in klines[:end_idx + 1]]
-                        if len(closes) >= 4:
+                        if len(closes) >= 16:
                             ret_3m = (closes[-1] - closes[-4]) / closes[-4] * 100.0
-                            if ret_3m <= -0.35:
-                                return 1
+                            ret_15m = (closes[-1] - closes[-16]) / closes[-16] * 100.0
+                            dump_warning = 1 if ret_3m <= -0.35 else 0
+                            return dump_warning, ret_15m
         except Exception:
             pass
-        return 0
+        return 0, 0.0
 
-    async def fetch_symbol_features(self, symbol: str, btc_dump: int) -> Optional[dict]:
+    async def fetch_symbol_features(self, symbol: str, btc_dump: int, btc_ret_15m: float = 0.0, side: str = "LONG") -> Optional[dict]:
         """
-        Fetches multi-timeframe Binance Futures Mainnet candles:
-        - 1m (limit=100) for real SMC (OB, FVG, S/R Flip, Breakout Retest) and Orderflow
+        Fetches multi-timeframe Binance Futures Mainnet candles for LONG or SHORT:
+        - 1m (limit=100) for real SMC (OB, FVG, S/R Flip, Breakout Retest / Breakdown Retest) and Orderflow
         - 15m (limit=30) for true 15m EMA trend (EMA 9 vs 21)
         - 1h (limit=30) for true 1h EMA trend (EMA 9 vs 21)
         Evaluates strictly on the last COMPLETED 1m bar (100% causal, zero look-ahead).
@@ -477,15 +508,15 @@ class LiveMarketEngine:
         ema21_15 = np.mean(c15[-21:])
         trend_15m_bull = 1 if ema9_15 > ema21_15 else 0
 
-        # Fast prune: if either trend is not bullish, don't waste CPU on SMC
-        if trend_15m_bull != 1 or trend_1h_bull != 1:
-            return {
-                "symbol": symbol,
-                "trend_15m_bull": trend_15m_bull,
-                "trend_1h_bull": trend_1h_bull,
-                "btc_dump_warning": btc_dump,
-                "skip": True
-            }
+        side_u = str(side).upper()
+
+        # Fast prune:
+        if side_u == "LONG":
+            if trend_15m_bull != 1 or trend_1h_bull != 1 or btc_dump == 1:
+                return {"symbol": symbol, "side": "LONG", "skip": True}
+        else: # SHORT
+            if trend_15m_bull != 0 or trend_1h_bull != 0 or btc_ret_15m > 0.6:
+                return {"symbol": symbol, "side": "SHORT", "skip": True}
 
         # 3. Last completed 1m candle
         curr_ms = int(time.time() * 1000)
@@ -513,6 +544,7 @@ class LiveMarketEngine:
         tb_ratio = target_tb_v / (target_v + 1e-8)
         candle_h = target_h - target_l + 1e-8
         lower_wick = (min(target_o, target_c) - target_l) / candle_h
+        upper_wick = (target_h - max(target_o, target_c)) / candle_h
 
         # True Range & ATR-15
         tr_list = [highs[0] - lows[0]]
@@ -521,52 +553,84 @@ class LiveMarketEngine:
             tr_list.append(tr)
         atr_15_pct = (np.mean(tr_list[-15:]) / target_c * 100.0) if len(tr_list) >= 15 else 1.0
 
-        # 5. Real Audited SMC Detection via smc_engine
-        rvols = np.ones(len(vols), dtype=np.float64)
-        for i in range(20, len(vols)):
-            rvols[i] = vols[i] / (np.mean(vols[i-20:i]) + 1e-8)
-        atr_arr = np.full(len(closes), atr_15_pct, dtype=np.float64)
-
-        fvg_trig, ob_trig, sr_trig, conf = compute_smc_for_symbol(
-            opens, highs, lows, closes, vols, rvols, atr_arr
-        )
-        smc_fvg_bull = int(fvg_trig[-1])
-        smc_ob_bull = int(ob_trig[-1])
-        smc_sr_flip = int(sr_trig[-1])
-
-        # Audited Breakout Retest from features_expanded.py:
-        # swing high over 15 bars, current bar breaks and retests, closed green
-        prev_swing_high_15 = np.max(highs[-16:-1]) if len(highs) >= 16 else highs[-2]
-        smc_breakout_retest_bull = 1 if (
-            target_c > target_o and 
-            target_l <= prev_swing_high_15 and 
-            target_c >= prev_swing_high_15 and 
-            target_c > closes[-2]
-        ) else 0
-
         utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
 
-        return {
-            "symbol": symbol,
-            "hour_utc": utc_hour,
-            "btc_dump_warning": btc_dump,
-            "trend_15m_bull": trend_15m_bull,
-            "trend_1h_bull": trend_1h_bull,
-            "rvol_20": rvol,
-            "taker_buy_ratio": tb_ratio,
-            "lower_wick_ratio": lower_wick,
-            "open": target_o,
-            "high": target_h,
-            "low": target_l,
-            "close": target_c,
-            "mark_price": mark_price,
-            "atr_15_pct": atr_15_pct,
-            "smc_ob_bull": smc_ob_bull,
-            "smc_fvg_bull": smc_fvg_bull,
-            "smc_sr_flip": smc_sr_flip,
-            "smc_breakout_retest_bull": smc_breakout_retest_bull,
-            "skip": False
-        }
+        if side_u == "LONG":
+            rvols = np.ones(len(vols), dtype=np.float64)
+            for i in range(20, len(vols)):
+                rvols[i] = vols[i] / (np.mean(vols[i-20:i]) + 1e-8)
+            atr_arr = np.full(len(closes), atr_15_pct, dtype=np.float64)
+
+            fvg_trig, ob_trig, sr_trig, conf = compute_smc_for_symbol(
+                opens, highs, lows, closes, vols, rvols, atr_arr
+            )
+            smc_fvg_bull = int(fvg_trig[-1])
+            smc_ob_bull = int(ob_trig[-1])
+            smc_sr_flip = int(sr_trig[-1])
+
+            prev_swing_high_15 = np.max(highs[-16:-1]) if len(highs) >= 16 else highs[-2]
+            smc_breakout_retest_bull = 1 if (
+                target_c > target_o and 
+                target_l <= prev_swing_high_15 and 
+                target_c >= prev_swing_high_15 and 
+                target_c > closes[-2]
+            ) else 0
+
+            return {
+                "symbol": symbol,
+                "side": "LONG",
+                "hour_utc": utc_hour,
+                "btc_dump_warning": btc_dump,
+                "btc_ret_15m": btc_ret_15m,
+                "trend_15m_bull": trend_15m_bull,
+                "trend_1h_bull": trend_1h_bull,
+                "rvol_20": rvol,
+                "taker_buy_ratio": tb_ratio,
+                "lower_wick_ratio": lower_wick,
+                "upper_wick_ratio": upper_wick,
+                "open": target_o,
+                "high": target_h,
+                "low": target_l,
+                "close": target_c,
+                "mark_price": mark_price,
+                "atr_15_pct": atr_15_pct,
+                "smc_ob_bull": smc_ob_bull,
+                "smc_fvg_bull": smc_fvg_bull,
+                "smc_sr_flip": smc_sr_flip,
+                "smc_breakout_retest_bull": smc_breakout_retest_bull,
+                "skip": False
+            }
+        else: # SHORT
+            # Audited Breakdown Retest:
+            prev_swing_low_15 = np.min(lows[-16:-1]) if len(lows) >= 16 else lows[-2]
+            smc_breakdown_retest_bear = 1 if (
+                target_c < target_o and
+                target_h >= prev_swing_low_15 and
+                target_c <= prev_swing_low_15 and
+                target_c < closes[-2]
+            ) else 0
+
+            return {
+                "symbol": symbol,
+                "side": "SHORT",
+                "hour_utc": utc_hour,
+                "btc_dump_warning": btc_dump,
+                "btc_ret_15m": btc_ret_15m,
+                "trend_15m_bull": trend_15m_bull,
+                "trend_1h_bull": trend_1h_bull,
+                "rvol_20": rvol,
+                "taker_buy_ratio": tb_ratio,
+                "lower_wick_ratio": lower_wick,
+                "upper_wick_ratio": upper_wick,
+                "open": target_o,
+                "high": target_h,
+                "low": target_l,
+                "close": target_c,
+                "mark_price": mark_price,
+                "atr_15_pct": atr_15_pct,
+                "smc_breakdown_retest_bear": smc_breakdown_retest_bear,
+                "skip": False
+            }
 
     async def fetch_position_candle_info(self, symbols: List[str]) -> Dict[str, dict]:
         """
@@ -621,25 +685,31 @@ class SMCStrategyEngine:
             enable_be=False
         )
 
-    def evaluate_entry_signal(self, row: dict) -> Tuple[bool, List[str]]:
+    def evaluate_entry_signal(self, row: dict, side: str = "LONG") -> Tuple[bool, List[str]]:
         if row.get("skip", False):
             return False, []
 
-        sig = self.system.evaluate_signal(row)
         reasons = []
-        if sig:
-            if row.get("smc_fvg_bull"):
-                reasons.append("FVG Imbalance")
-            if row.get("smc_ob_bull"):
-                reasons.append("Order Block")
-            if row.get("smc_sr_flip"):
-                reasons.append("S/R Flip")
-            if row.get("smc_breakout_retest_bull"):
-                reasons.append("Breakout Retest")
+        if str(side).upper() == "LONG":
+            sig = self.system.evaluate_signal(row)
+            if sig:
+                if row.get("smc_fvg_bull"):
+                    reasons.append("FVG Imbalance")
+                if row.get("smc_ob_bull"):
+                    reasons.append("Order Block")
+                if row.get("smc_sr_flip"):
+                    reasons.append("S/R Flip")
+                if row.get("smc_breakout_retest_bull"):
+                    reasons.append("Breakout Retest")
+        else: # SHORT
+            sig = self.system.evaluate_short_signal(row)
+            if sig:
+                if row.get("smc_breakdown_retest_bear"):
+                    reasons.append("Breakdown Retest")
         return sig, reasons
 
-    def calculate_sltp(self, entry_price: float, atr_15_pct: float) -> Tuple[float, float, float, float]:
-        return self.system.calculate_sltp(entry_price, atr_15_pct)
+    def calculate_sltp(self, entry_price: float, atr_15_pct: float, side: str = "LONG") -> Tuple[float, float, float, float]:
+        return self.system.calculate_sltp(entry_price, atr_15_pct, side=side)
 
 
 # =====================================================================
@@ -815,21 +885,30 @@ class LivePaperBot:
     async def notify_order_open(self, pos: dict):
         m = pos["metrics"]
         patterns_str = ", ".join(m.get("patterns", ["SMC Setup"]))
+        side = pos.get("side", "LONG").upper()
+        is_long = (side == "LONG")
+        side_tag = "LONG 🟢" if is_long else "SHORT 🔴"
+        header = "🚀 <b>НОВА УГОДА / ВІДКРИТО ЛОНГ</b>" if is_long else "🔻 <b>НОВА УГОДА / ВІДКРИТО ШОРТ</b>"
+        sl_sign = "-" if is_long else "+"
+        tp_sign = "+" if is_long else "-"
+        wick_name = "Відкупний гніт (знизу)" if is_long else "Гніт відхилення (зверху)"
+        trend_name = "Бичачий (EMA)" if is_long else "Ведмежий (EMA)"
+
         msg = (
-            "🚀 <b>НОВА УГОДА / ПОЗИЦІЮ ВІДКРИТО</b>\n"
+            f"{header}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 <b>Монета:</b> #{pos['symbol']} (LONG 🟢)\n"
+            f"🪙 <b>Монета:</b> #{pos['symbol']} ({side_tag})\n"
             f"💵 <b>Ціна входу:</b> ${pos['entry_price']:.4f}\n"
             f"📦 <b>Об'єм:</b> ${pos['notional_usd']:.2f} (Маржа: ${pos['margin_usd']:.2f} × {pos['leverage']:.0f}x)\n\n"
-            f"🎯 <b>Take Profit:</b> ${pos['tp_price']:.4f} (+{pos['tp_pct']:.2f}%)\n"
-            f"🛑 <b>Stop Loss:</b> ${pos['sl_price']:.4f} (-{pos['sl_pct']:.2f}%)\n"
+            f"🎯 <b>Take Profit:</b> ${pos['tp_price']:.4f} ({tp_sign}{pos['tp_pct']:.2f}%)\n"
+            f"🛑 <b>Stop Loss:</b> ${pos['sl_price']:.4f} ({sl_sign}{pos['sl_pct']:.2f}%)\n"
             f"⏱️ <b>Макс. утримання:</b> {self.max_hold_minutes} хв\n\n"
             "📊 <b>Сигнали та метрики:</b>\n"
             f"• Патерн: <i>{patterns_str}</i>\n"
             f"• RVOL (20m): <b>{m.get('rvol', 1.0):.2f}x</b>\n"
             f"• Taker Buy Ratio: <b>{m.get('taker_buy', 0.5)*100:.1f}%</b>\n"
-            f"• Відкупний гніт: <b>{m.get('wick', 0.2)*100:.1f}%</b>\n"
-            "• 15m/1h Тренд: <b>Бичачий (EMA)</b>\n\n"
+            f"• {wick_name}: <b>{m.get('wick', 0.2)*100:.1f}%</b>\n"
+            f"• 15m/1h Тренд: <b>{trend_name}</b>\n\n"
             f"💼 <b>Баланс:</b> ${self.portfolio.balance:.2f} | <b>Вільна маржа:</b> ${self.portfolio.get_free_margin():.2f}\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
@@ -837,6 +916,9 @@ class LivePaperBot:
 
     async def notify_trade_close(self, t: dict):
         sym = t["symbol"]
+        side = t.get("side", "LONG").upper()
+        is_long = (side == "LONG")
+        side_tag = "LONG 🟢" if is_long else "SHORT 🔴"
         exit_r = t["exit_reason"]
         net_pnl = t["net_pnl_usd"]
         pnl_pct = t["price_change_pct"]
@@ -848,20 +930,20 @@ class LivePaperBot:
         duration_str = f"{mins}хв {secs}с"
 
         if exit_r == "TP":
-            header = "🎯 <b>ТЕЙК ПРОФІТ СПРАЦЮВАВ! [WIN]</b>"
+            header = f"🎯 <b>ТЕЙК ПРОФІТ СПРАЦЮВАВ! [WIN]</b> ({side_tag})"
             pnl_line = f"💰 <b>Чистий прибуток:</b> +${net_pnl:.2f} USDT (+{roi_margin:.1f}% до маржі)"
         elif exit_r == "SL":
-            header = "🛑 <b>СТОП ЛОСС СПРАЦЮВАВ [LOSS]</b>"
+            header = f"🛑 <b>СТОП ЛОСС СПРАЦЮВАВ [LOSS]</b> ({side_tag})"
             pnl_line = f"💸 <b>Збиток:</b> -${abs(net_pnl):.2f} USDT ({roi_margin:.1f}% до маржі)"
         else:
             pnl_emoji = "🟢" if net_pnl >= 0 else "🔴"
-            header = "⏱️ <b>ЗАКРИТТЯ ЗА ЧАСОМ (15 ХВ)</b>"
+            header = f"⏱️ <b>ЗАКРИТТЯ ЗА ЧАСОМ (15 ХВ)</b> ({side_tag})"
             pnl_line = f"{pnl_emoji} <b>Чистий PnL:</b> {net_pnl:+.2f} USDT ({roi_margin:+.1f}% до маржі)\n⏱️ <i>Причина: Застій понад 15 хв (звільнення слота)</i>"
 
         msg = (
             f"{header}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🪙 <b>Монета:</b> #{sym}\n"
+            f"🪙 <b>Монета:</b> #{sym} ({side_tag})\n"
             f"💵 <b>Вхід:</b> ${t['entry_price']:.4f} ➔ <b>Вихід:</b> ${t['exit_price']:.4f}\n"
             f"📈 <b>Рух ціни:</b> {pnl_pct:+.2f}%\n"
             f"{pnl_line}\n"
@@ -891,7 +973,7 @@ class LivePaperBot:
             f"🎯 <b>Вінрейт:</b> {stats['win_rate']:.1f}% ({stats['wins']}W / {stats['losses']}L)\n"
             f"📊 <b>Всього угод:</b> {stats['total_trades']}\n"
             f"📌 <b>Активних позицій:</b> {stats['active_count']} / {self.portfolio.max_positions}\n"
-            "🔍 <b>Статус:</b> Моніторинг ринку Binance Mainnet працює стабільно\n"
+            "🔍 <b>Статус:</b> Моніторинг ринку Binance Mainnet (DUAL: Long+Short) працює стабільно\n"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
         await self.notifier.send_message(msg)
@@ -899,7 +981,7 @@ class LivePaperBot:
     async def watch_active_positions(self):
         """
         High-frequency position checking loop (runs every 2.5 seconds).
-        Monitors open positions against TP, SL, and 15m time limits.
+        Monitors open positions against TP, SL, and 15m time limits for both LONG and SHORT.
         """
         if not self.portfolio.active_positions:
             return
@@ -927,43 +1009,54 @@ class LivePaperBot:
             if low_p < pos["lowest_price"]:
                 pos["lowest_price"] = low_p
 
+            side = pos.get("side", "LONG").upper()
             sl_p = pos["sl_price"]
             tp_p = pos["tp_price"]
             entry_p = pos["entry_price"]
             hold_sec = now_ts - pos["entry_time"]
-            cur_pnl_pct = (cur_p - entry_p) / entry_p * 100.0
-            cur_unpnl_usd = pos["notional_usd"] * ((cur_p - entry_p) / entry_p)
+
+            if side == "LONG":
+                cur_pnl_pct = (cur_p - entry_p) / entry_p * 100.0
+                cur_unpnl_usd = pos["notional_usd"] * ((cur_p - entry_p) / entry_p)
+                hit_tp = (cur_p >= tp_p) or (high_p >= tp_p)
+                hit_sl = (cur_p <= sl_p) or (low_p <= sl_p)
+                exit_tp_price = tp_p
+                exit_sl_price = sl_p
+            else: # SHORT
+                cur_pnl_pct = (entry_p - cur_p) / entry_p * 100.0
+                cur_unpnl_usd = pos["notional_usd"] * ((entry_p - cur_p) / entry_p)
+                hit_tp = (cur_p <= tp_p) or (low_p <= tp_p)
+                hit_sl = (cur_p >= sl_p) or (high_p >= sl_p)
+                exit_tp_price = tp_p
+                exit_sl_price = sl_p
 
             # Telemetry print
-            print(f"   [Position Active] {sym}: Entry ${entry_p:.4f} | Cur ${cur_p:.4f} ({cur_pnl_pct:+.2f}%) | UnPnL: ${cur_unpnl_usd:+.2f} | Hold: {hold_sec/60:.1f}m/{self.max_hold_minutes}m")
+            print(f"   [Pos Active {side}] {sym}: Entry ${entry_p:.4f} | Cur ${cur_p:.4f} ({cur_pnl_pct:+.2f}%) | UnPnL: ${cur_unpnl_usd:+.2f} | Hold: {hold_sec/60:.1f}m/{self.max_hold_minutes}m")
 
             # Check SL and TP triggers (including wicks)
-            hit_tp = (cur_p >= tp_p) or (high_p >= tp_p)
-            hit_sl = (cur_p <= sl_p) or (low_p <= sl_p)
-
             if hit_tp and hit_sl:
                 # Both breached in wild volatility -> conservative execution: trigger SL
-                print(f"\n[🛑 STOP LOSS TRIGGERED (Wick Flash)] {sym} touched both brackets in bar")
-                trade_res = self.portfolio.close_position(sym, sl_p, "SL")
+                print(f"\n[🛑 STOP LOSS TRIGGERED (Wick Flash)] {sym} ({side}) touched both brackets in bar")
+                trade_res = self.portfolio.close_position(sym, exit_sl_price, "SL")
                 if trade_res:
                     await self.notify_trade_close(trade_res)
                 continue
             elif hit_tp:
-                print(f"\n[🎯 TAKE PROFIT TRIGGERED] {sym} High ${high_p:.4f} reached TP ${tp_p:.4f}")
-                trade_res = self.portfolio.close_position(sym, tp_p, "TP")
+                print(f"\n[🎯 TAKE PROFIT TRIGGERED] {sym} ({side}) reached TP ${tp_p:.4f}")
+                trade_res = self.portfolio.close_position(sym, exit_tp_price, "TP")
                 if trade_res:
                     await self.notify_trade_close(trade_res)
                 continue
             elif hit_sl:
-                print(f"\n[🛑 STOP LOSS TRIGGERED] {sym} Low ${low_p:.4f} reached SL ${sl_p:.4f}")
-                trade_res = self.portfolio.close_position(sym, sl_p, "SL")
+                print(f"\n[🛑 STOP LOSS TRIGGERED] {sym} ({side}) reached SL ${sl_p:.4f}")
+                trade_res = self.portfolio.close_position(sym, exit_sl_price, "SL")
                 if trade_res:
                     await self.notify_trade_close(trade_res)
                 continue
 
             # Check 15-Minute Time Exit
             if hold_sec >= self.max_hold_minutes * 60:
-                print(f"\n[⏱️ TIME EXIT TRIGGERED] {sym} held for {hold_sec/60:.1f}m >= {self.max_hold_minutes}m")
+                print(f"\n[⏱️ TIME EXIT TRIGGERED] {sym} ({side}) held for {hold_sec/60:.1f}m >= {self.max_hold_minutes}m")
                 trade_res = self.portfolio.close_position(sym, cur_p, "TIME_EXIT")
                 if trade_res:
                     await self.notify_trade_close(trade_res)
@@ -971,38 +1064,48 @@ class LivePaperBot:
 
     async def scan_and_evaluate_signals(self):
         """
-        Screens Binance Futures Mainnet for In-Play momentum setups.
+        Screens Binance Futures Mainnet for DUAL (Long Gainers + Short Dumpers) setups.
         """
-        # If portfolio is full, skip scanning to save API quota
         if not self.portfolio.can_open_position("TEST_CHECK"):
             return
 
-        # 1. Fast screen of top candidates
-        top_coins = await self.market.scan_inplay_candidates(
+        # 1. Fast screen of top candidates (Gainers + Dumpers)
+        candidates_dict = await self.market.scan_inplay_candidates(
             min_vol_usd=10_000_000.0,
-            min_range_pct=4.0,
-            top_n=20
+            min_range_pct=3.5,
+            top_n=15
         )
-        if not top_coins:
+        gainers = candidates_dict.get("gainers", [])
+        dumpers = candidates_dict.get("dumpers", [])
+
+        if not gainers and not dumpers:
             self.last_scan_info["error"] = "No candidates or Binance API rate-limit/ban (HTTP 418/429)"
             return
 
         self.last_scan_info["timestamp"] = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S UTC")
-        self.last_scan_info["candidates_count"] = len(top_coins)
-        self.last_scan_info["leaders"] = [c["symbol"] for c in top_coins[:6]]
+        self.last_scan_info["candidates_count"] = len(gainers) + len(dumpers)
+        self.last_scan_info["leaders"] = [c["symbol"] for c in gainers[:4]] + [c["symbol"] for c in dumpers[:4]]
         self.last_scan_info["error"] = None
 
-        # 2. BTC Dump Shield check
-        btc_dump = await self.market.check_btc_dump_warning()
-        leaders_str = ", ".join([f"{c['symbol']} ({c['change_24h_pct']:+.1f}%)" for c in top_coins[:6]])
-        print(f"   Screened {len(top_coins)} In-Play Leaders (Top: {leaders_str}) | BTC Shield: {'DUMP TRIGGERED ⚠️' if btc_dump else 'NORMAL 🟢'}")
+        # 2. BTC Status check (Dump & Pump Shield)
+        btc_dump, btc_ret_15m = await self.market.check_btc_status()
+        
+        gainers_str = ", ".join([f"{c['symbol']} ({c['change_24h_pct']:+.1f}%)" for c in gainers[:4]])
+        dumpers_str = ", ".join([f"{c['symbol']} ({c['change_24h_pct']:+.1f}%)" for c in dumpers[:4]])
+        btc_status_str = "DUMP ⚠️" if btc_dump else ("PUMP ⚠️" if btc_ret_15m > 0.6 else "NORMAL 🟢")
+        print(f"   [Scanner DUAL] Gainers: {gainers_str or 'None'} | Dumpers: {dumpers_str or 'None'} | BTC: {btc_status_str} ({btc_ret_15m:+.2f}%)")
 
-        # 3. Fetch features for candidates concurrently
+        # 3. Queue candidate evaluations concurrently
         eval_tasks = []
-        for c in top_coins:
+        for c in gainers:
             sym = c["symbol"]
             if self.portfolio.can_open_position(sym):
-                eval_tasks.append(self.market.fetch_symbol_features(sym, btc_dump))
+                eval_tasks.append(self.market.fetch_symbol_features(sym, btc_dump, btc_ret_15m, side="LONG"))
+
+        for c in dumpers:
+            sym = c["symbol"]
+            if self.portfolio.can_open_position(sym):
+                eval_tasks.append(self.market.fetch_symbol_features(sym, btc_dump, btc_ret_15m, side="SHORT"))
 
         if not eval_tasks:
             return
@@ -1011,31 +1114,33 @@ class LivePaperBot:
 
         # 4. Evaluate each candidate
         for feat in features:
-            if not isinstance(feat, dict) or not feat:
+            if not isinstance(feat, dict) or not feat or feat.get("skip", False):
                 continue
 
             sym = feat["symbol"]
+            side = feat.get("side", "LONG").upper()
             if not self.portfolio.can_open_position(sym):
                 continue
 
-            signal_ok, patterns = self.strategy.evaluate_entry_signal(feat)
+            signal_ok, patterns = self.strategy.evaluate_entry_signal(feat, side=side)
             if signal_ok:
                 entry_price = feat.get("mark_price", feat["close"])
                 atr = feat.get("atr_15_pct", 1.0)
-                sl_pct, tp_pct, sl_p, tp_p = self.strategy.calculate_sltp(entry_price, atr)
+                sl_pct, tp_pct, sl_p, tp_p = self.strategy.calculate_sltp(entry_price, atr, side=side)
 
                 metrics = {
                     "rvol": feat["rvol_20"],
                     "taker_buy": feat["taker_buy_ratio"],
-                    "wick": feat["lower_wick_ratio"],
+                    "wick": feat["lower_wick_ratio"] if side == "LONG" else feat["upper_wick_ratio"],
                     "atr": atr,
                     "patterns": patterns
                 }
 
+                bracket_str = f"SL @ ${sl_p:.4f} (-{sl_pct:.2f}%) | TP @ ${tp_p:.4f} (+{tp_pct:.2f}%)" if side == "LONG" else f"SL @ ${sl_p:.4f} (+{sl_pct:.2f}%) | TP @ ${tp_p:.4f} (-{tp_pct:.2f}%)"
                 print(f"\n" + "="*80)
-                print(f"🚀 [SIGNAL CONFIRMED] {sym} @ ${entry_price:.4f}")
+                print(f"🚀 [SIGNAL CONFIRMED - {side}] {sym} @ ${entry_price:.4f}")
                 print(f"   Patterns: {patterns} | RVOL: {feat['rvol_20']:.2f}x | TakerBuy: {feat['taker_buy_ratio']*100:.1f}%")
-                print(f"   Brackets: SL @ ${sl_p:.4f} (-{sl_pct:.2f}%) | TP @ ${tp_p:.4f} (+{tp_pct:.2f}%)")
+                print(f"   Brackets: {bracket_str}")
                 print("="*80)
 
                 pos = self.portfolio.open_position(
@@ -1045,12 +1150,12 @@ class LivePaperBot:
                     sl_pct=sl_pct,
                     tp_price=tp_p,
                     tp_pct=tp_pct,
-                    metrics=metrics
+                    metrics=metrics,
+                    side=side
                 )
 
                 await self.notify_order_open(pos)
 
-                # If portfolio is now full, break early
                 if not self.portfolio.can_open_position("TEST_CHECK"):
                     break
 
