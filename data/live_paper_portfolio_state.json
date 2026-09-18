@@ -1,15 +1,45 @@
 {
   "starting_balance": 100.0,
-  "balance": 100.0,
-  "peak_balance": 100.0,
+  "balance": 113.2484,
+  "peak_balance": 113.2484,
   "max_drawdown_pct": 0.0,
   "margin_per_trade": 10.0,
   "leverage": 20.0,
   "max_positions": 3,
-  "total_trades": 0,
-  "wins": 0,
+  "total_trades": 4,
+  "wins": 4,
   "losses": 0,
-  "win_rate_pct": 0.0,
-  "active_positions": {},
-  "last_updated": "2026-09-18 16:42:00"
+  "win_rate_pct": 100.0,
+  "active_positions": {
+    "UAIUSDT": {
+      "symbol": "UAIUSDT",
+      "side": "LONG",
+      "entry_time": 1789742355.5070002,
+      "entry_time_str": "2026-09-18 17:39:15",
+      "entry_price": 0.4166,
+      "margin_usd": 10.0,
+      "leverage": 20.0,
+      "notional_usd": 200.0,
+      "sl_price": 0.4091012,
+      "sl_pct": 1.8,
+      "tp_price": 0.4215992,
+      "tp_pct": 1.2,
+      "highest_price": 0.4202,
+      "lowest_price": 0.4104,
+      "metrics": {
+        "rvol": 3.7095290085752457,
+        "taker_buy": 0.7897228948075556,
+        "wick": 0.17142808163406517,
+        "atr": 0.4093707523786673,
+        "patterns": [
+          "Order Block"
+        ]
+      }
+    }
+  },
+  "symbol_cooldown": {
+    "LSKUSDT": 1789743813.0,
+    "GUSDT": 1789744028.0
+  },
+  "last_updated": "2026-09-18 17:55:50"
 }

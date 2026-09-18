@@ -1,1 +1,5 @@
 trade_id,symbol,side,entry_time,exit_time,duration_sec,entry_price,exit_price,margin_usd,leverage,notional_usd,exit_reason,price_change_pct,gross_pnl_usd,fee_usd,net_pnl_usd,roi_margin_pct,balance_after,win_rate_pct
+1,MYXUSDT,LONG,2026-09-18 16:47:10,2026-09-18 16:52:22,311,0.1039,0.1068092,10.0,20.0,200.0,TP,2.8,5.6,0.3,5.3,53.0,105.3,100.0
+2,ARUSDT,LONG,2026-09-18 17:12:14,2026-09-18 17:27:16,902,3.088,3.108,10.0,20.0,200.0,TIME_EXIT,0.648,1.2953,0.3,0.9953,9.95,106.3,100.0
+3,LSKUSDT,LONG,2026-09-18 17:38:10,2026-09-18 17:40:47,157,0.49516,0.50110192,10.0,20.0,200.0,TP,1.2,2.4,0.3,2.1,21.0,108.4,100.0
+4,GUSDT,LONG,2026-09-18 17:33:21,2026-09-18 17:42:18,536,0.009872,0.010126356742671011,10.0,20.0,200.0,TP,2.577,5.1531,0.3,4.8531,48.53,113.25,100.0
