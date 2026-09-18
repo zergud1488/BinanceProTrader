@@ -29,7 +29,8 @@ class UnifiedTradingSystem:
                  slippage_pct: float = 0.00025,
                  max_hold_bars: int = 15,
                  enable_be: bool = False,
-                 be_trigger_ratio: float = 0.50):
+                 be_trigger_ratio: float = 0.50,
+                 cooldown_bars: int = 20):
         self.starting_balance = starting_balance
         self.margin_fraction = margin_fraction
         self.leverage = leverage
@@ -39,6 +40,7 @@ class UnifiedTradingSystem:
         self.max_hold_bars = max_hold_bars
         self.enable_be = enable_be
         self.be_trigger_ratio = be_trigger_ratio
+        self.cooldown_bars = cooldown_bars
 
     def evaluate_signal(self, row: dict) -> bool:
         """
@@ -232,6 +234,7 @@ class UnifiedTradingSystem:
         active_positions = []
         completed_trades = []
         open_symbols = set()
+        symbol_cooldown_until = {}
         trade_id_counter = 0
         max_concurrent_seen = 0
 
@@ -351,6 +354,9 @@ class UnifiedTradingSystem:
                         max_dd = dd
 
                     open_symbols.remove(sym)
+                    if self.cooldown_bars > 0:
+                        symbol_cooldown_until[sym] = curr_t + (self.cooldown_bars * 60000)
+
                     pos["net_pnl_usd"] = net_pnl_usd
                     pos["equity_after"] = total_equity
                     pos["free_margin_after"] = free_margin
@@ -366,6 +372,8 @@ class UnifiedTradingSystem:
             for sig in signals_by_time[t]:
                 sym = sig["symbol"]
                 if sym in open_symbols:
+                    continue
+                if entry_time < symbol_cooldown_until.get(sym, 0):
                     continue
 
                 if self.compounding:

@@ -109,6 +109,7 @@ class PaperPortfolio:
                  leverage: float = 20.0,
                  max_concurrent_positions: int = 3,
                  friction_pct: float = 0.0015,
+                 cooldown_minutes: float = 20.0,
                  state_file: Optional[Path] = None,
                  trades_csv: Optional[Path] = None):
         self.state_file = state_file or STATE_FILE
@@ -120,6 +121,7 @@ class PaperPortfolio:
         self.leverage = leverage
         self.max_positions = max_concurrent_positions
         self.friction_pct = friction_pct
+        self.cooldown_minutes = cooldown_minutes
         
         self.peak_balance = starting_balance
         self.max_drawdown_pct = 0.0
@@ -131,12 +133,15 @@ class PaperPortfolio:
         self.active_positions: Dict[str, dict] = {}
         # History of completed trades: [dict, ...] (bounded to recent 100 in memory)
         self.closed_trades: List[dict] = []
+        # Cooldown timer after trade close: {symbol: expiry_timestamp}
+        self.symbol_cooldown: Dict[str, float] = {}
 
         self._init_csv()
         self.load_state()
 
     def _init_csv(self):
         if not self.trades_csv.exists():
+            self.trades_csv.parent.mkdir(parents=True, exist_ok=True)
             with open(self.trades_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
@@ -152,13 +157,39 @@ class PaperPortfolio:
         return max(0.0, self.balance - committed_margin)
 
     def can_open_position(self, symbol: str) -> bool:
-        if symbol in self.active_positions:
-            return False
+        # 1. Capacity & Free Margin checks
         if len(self.active_positions) >= self.max_positions:
             return False
         if self.get_free_margin() < self.margin_per_trade:
             return False
+            
+        # If testing general slot/margin capacity only
+        if symbol == "TEST_CHECK":
+            return True
+
+        # 2. Duplicate active position check
+        if symbol in self.active_positions:
+            return False
+
+        # 3. Symbol Cooldown check (prevent immediate re-entry / peak buying)
+        if symbol in self.symbol_cooldown:
+            remaining = self.symbol_cooldown[symbol] - time.time()
+            if remaining > 0:
+                return False
+            else:
+                del self.symbol_cooldown[symbol]
+
         return True
+
+    def get_symbol_cooldown_remaining(self, symbol: str) -> float:
+        """Returns remaining seconds of cooldown for symbol, or 0.0 if not cooling down."""
+        if symbol in self.symbol_cooldown:
+            remaining = self.symbol_cooldown[symbol] - time.time()
+            if remaining > 0:
+                return remaining
+            else:
+                del self.symbol_cooldown[symbol]
+        return 0.0
 
     def open_position(self, symbol: str, entry_price: float, sl_price: float, 
                       sl_pct: float, tp_price: float, tp_pct: float, 
@@ -252,6 +283,12 @@ class PaperPortfolio:
             "win_rate_pct": round(win_rate, 2)
         }
 
+        # Apply Symbol Cooldown (prevent immediate re-entry / FOMO buying at peak)
+        if self.cooldown_minutes > 0:
+            self.symbol_cooldown[symbol] = now_ts + (self.cooldown_minutes * 60.0)
+            until_str = datetime.datetime.fromtimestamp(self.symbol_cooldown[symbol]).strftime("%H:%M:%S")
+            print(f"   [⏳ COOLDOWN] {symbol} locked for {self.cooldown_minutes:.0f}m until {until_str}")
+
         self.closed_trades.append(trade_record)
         if len(self.closed_trades) > 200:
             self.closed_trades = self.closed_trades[-100:]
@@ -275,6 +312,10 @@ class PaperPortfolio:
             print(f"[!] Error writing to trades CSV: {e}")
 
     def save_state(self):
+        now_ts = time.time()
+        active_cooldowns = {
+            s: round(exp, 1) for s, exp in self.symbol_cooldown.items() if exp > now_ts
+        }
         state = {
             "starting_balance": self.starting_balance,
             "balance": round(self.balance, 4),
@@ -288,6 +329,7 @@ class PaperPortfolio:
             "losses": self.losses,
             "win_rate_pct": round((self.wins / self.total_trades * 100.0) if self.total_trades > 0 else 0.0, 2),
             "active_positions": self.active_positions,
+            "symbol_cooldown": active_cooldowns,
             "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         for attempt in range(3):
@@ -317,7 +359,13 @@ class PaperPortfolio:
             self.wins = data.get("wins", self.wins)
             self.losses = data.get("losses", self.losses)
             self.active_positions = data.get("active_positions", {})
+            now_ts = time.time()
+            raw_cooldowns = data.get("symbol_cooldown", {})
+            self.symbol_cooldown = {s: float(exp) for s, exp in raw_cooldowns.items() if float(exp) > now_ts}
             print(f"[+] Loaded existing paper portfolio state: Balance=${self.balance:.2f}, Active Pos={len(self.active_positions)}, Trades={self.total_trades}")
+            if self.symbol_cooldown:
+                cd_summary = [f"{s} ({(exp - now_ts)/60:.1f}m left)" for s, exp in self.symbol_cooldown.items()]
+                print(f"[+] Active cooldowns restored: {', '.join(cd_summary)}")
         except Exception as e:
             print(f"[!] Error loading state file: {e}. Using clean defaults.")
 
@@ -325,6 +373,8 @@ class PaperPortfolio:
         total_pnl = self.balance - self.starting_balance
         total_roi = (total_pnl / self.starting_balance) * 100.0
         win_rate = (self.wins / self.total_trades * 100.0) if self.total_trades > 0 else 0.0
+        now_ts = time.time()
+        active_cd = len([s for s, exp in self.symbol_cooldown.items() if exp > now_ts])
         return {
             "balance": self.balance,
             "starting_balance": self.starting_balance,
@@ -337,7 +387,8 @@ class PaperPortfolio:
             "losses": self.losses,
             "peak_balance": self.peak_balance,
             "max_drawdown": self.max_drawdown_pct,
-            "active_count": len(self.active_positions)
+            "active_count": len(self.active_positions),
+            "cooldown_count": active_cd
         }
 
 
@@ -764,11 +815,13 @@ class LivePaperBot:
                  scan_interval_sec: int = 20, 
                  position_check_interval_sec: float = 2.5,
                  max_hold_minutes: int = 60,
-                 scan_limit: int = 100):
+                 scan_limit: int = 100,
+                 cooldown_minutes: float = 20.0):
         self.scan_interval = scan_interval_sec
         self.pos_check_interval = position_check_interval_sec
         self.max_hold_minutes = max_hold_minutes
         self.scan_limit = scan_limit
+        self.cooldown_minutes = cooldown_minutes
         
         self.notifier = TelegramNotifier(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         self.portfolio = PaperPortfolio(
@@ -776,7 +829,8 @@ class LivePaperBot:
             margin_per_trade=10.0,
             leverage=20.0,
             max_concurrent_positions=3,
-            friction_pct=0.0015
+            friction_pct=0.0015,
+            cooldown_minutes=cooldown_minutes
         )
         self.market = LiveMarketEngine(concurrency_limit=25)
         self.strategy = SMCStrategyEngine()
@@ -796,6 +850,7 @@ class LivePaperBot:
         print("🚀 INITIALIZING AUTONOMOUS LIVE PAPER TRADING BOT (BINANCE MAINNET)")
         print(f"   Capital: ${self.portfolio.balance:.2f} | Leverage: {self.portfolio.leverage}x | Margin/Trade: ${self.portfolio.margin_per_trade:.2f}")
         print(f"   Max Pos: {self.portfolio.max_positions} | Max Hold: {self.max_hold_minutes}m | Scan Limit: {self.scan_limit} coins | Strategy: SMC (NO BE)")
+        print(f"   Symbol Cooldown: {self.cooldown_minutes:.0f}m (Anti-FOMO / Re-entry shield)")
         print(f"   Telegram Alerts: Chat ID {TELEGRAM_CHAT_ID} (YabkoShop_bot)")
         print("="*80)
 
@@ -813,6 +868,7 @@ class LivePaperBot:
             "🎯 <b>Take Profit:</b> Динамічний 1.4x ATR (1.0% – 2.8%)\n"
             "🛑 <b>Stop Loss:</b> Динамічний 2.0x ATR (1.6% – 3.5%)\n"
             f"⏱️ <b>Тайм-аут:</b> {self.max_hold_minutes} хв (закриття застою)\n"
+            f"⏳ <b>Кулдаун монет:</b> {self.cooldown_minutes:.0f} хв (захист від повторних входів)\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "✅ <i>Моніторинг 725+ пар активовано! Сповіщення будуть надходити миттєво.</i>"
         )
@@ -832,6 +888,15 @@ class LivePaperBot:
                 pos_list += f"<li><b>{s}</b>: Entry ${p['entry_price']:.4f} | TP: ${p['tp_price']:.4f} | SL: ${p['sl_price']:.4f}</li>"
             if not pos_list:
                 pos_list = "<i>Немає відкритих позицій</i>"
+
+            now_ts = time.time()
+            cool_list = ""
+            for s, exp in self.portfolio.symbol_cooldown.items():
+                rem = exp - now_ts
+                if rem > 0:
+                    cool_list += f"<li><b>{s}</b>: {rem/60:.1f} хв залишилось</li>"
+            if not cool_list:
+                cool_list = "<i>Немає монет на кулдауні</i>"
             
             pnl_col = "#0ecb81" if stats['total_pnl'] >= 0 else "#f6465d"
             html = f"""<!DOCTYPE html>
@@ -857,10 +922,15 @@ class LivePaperBot:
         <div class="row"><span>Вінрейт:</span><b>{stats['win_rate']:.1f}% ({stats['wins']}W / {stats['losses']}L)</b></div>
         <div class="row"><span>Всього угод:</span><b>{stats['total_trades']}</b></div>
         <div class="row"><span>Вільна маржа:</span><b>${stats['free_margin']:.2f} USDT</b></div>
+        <div class="row"><span>Кулдаун монет:</span><b>{self.portfolio.cooldown_minutes:.0f} хв ({stats.get('cooldown_count', 0)} активних)</b></div>
     </div>
     <div class="card">
         <h3>📌 Активні позиції ({stats['active_count']}/3)</h3>
         <ul>{pos_list}</ul>
+    </div>
+    <div class="card">
+        <h3>⏳ Монети на кулдауні ({stats.get('cooldown_count', 0)})</h3>
+        <ul>{cool_list}</ul>
     </div>
 </body>
 </html>"""
@@ -898,6 +968,11 @@ class LivePaperBot:
             except Exception as e:
                 ws_status = f"WS Error: {e}"
 
+            now_ts = time.time()
+            active_cds = {
+                s: round((exp - now_ts)/60, 1) for s, exp in self.portfolio.symbol_cooldown.items() if exp > now_ts
+            }
+
             return web.json_response({
                 "status": "ok",
                 "egress_ip": egress_ip,
@@ -906,6 +981,7 @@ class LivePaperBot:
                 "binance_ws": ws_status,
                 "balance": self.portfolio.balance,
                 "active_positions": list(self.portfolio.active_positions.keys()),
+                "symbol_cooldowns_minutes_left": active_cds,
                 "last_scan": self.last_scan_info,
                 "stats": self.portfolio.get_stats()
             })
@@ -981,6 +1057,8 @@ class LivePaperBot:
             header = f"⏱️ <b>ЗАКРИТТЯ ЗА ЧАСОМ (15 ХВ)</b> ({side_tag})"
             pnl_line = f"{pnl_emoji} <b>Чистий PnL:</b> {net_pnl:+.2f} USDT ({roi_margin:+.1f}% до маржі)\n⏱️ <i>Причина: Застій понад 15 хв (звільнення слота)</i>"
 
+        cooldown_notice = f"• Кулдаун #{sym}: <b>{self.portfolio.cooldown_minutes:.0f} хв</b> (захист від входу на піку)\n" if self.portfolio.cooldown_minutes > 0 else ""
+
         msg = (
             f"{header}\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -994,6 +1072,7 @@ class LivePaperBot:
             f"• Загальний PnL: <b>{stats['total_pnl']:+.2f} USDT ({stats['total_roi']:+.1f}%)</b>\n"
             f"• Вінрейт: <b>{stats['win_rate']:.1f}%</b> ({stats['wins']}W / {stats['losses']}L | всього: {stats['total_trades']})\n"
             f"• Макс. просадка: <b>{stats['max_drawdown']:.1f}%</b>\n"
+            f"{cooldown_notice}"
             "━━━━━━━━━━━━━━━━━━━━━━"
         )
         await self.notifier.send_message(msg)
@@ -1284,6 +1363,7 @@ def main():
     parser.add_argument("--pos_interval", type=float, default=2.5, help="Position monitoring interval in seconds")
     parser.add_argument("--max_hold", type=int, default=60, help="Maximum position hold time in minutes (default: 60)")
     parser.add_argument("--scan_limit", type=int, default=100, help="Maximum number of in-play coins to scan per cycle (default: 100)")
+    parser.add_argument("--cooldown", type=float, default=20.0, help="Symbol cooldown in minutes after trade exit (default: 20)")
     parser.add_argument("--single_cycle", action="store_true", help="Run 1 monitoring cycle and exit (for verification)")
     args = parser.parse_args()
 
@@ -1291,7 +1371,8 @@ def main():
         scan_interval_sec=args.scan_interval,
         position_check_interval_sec=args.pos_interval,
         max_hold_minutes=args.max_hold,
-        scan_limit=args.scan_limit
+        scan_limit=args.scan_limit,
+        cooldown_minutes=args.cooldown
     )
 
     loop = asyncio.new_event_loop()
