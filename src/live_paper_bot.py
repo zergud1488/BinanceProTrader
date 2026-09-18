@@ -770,17 +770,30 @@ class LivePaperBot:
             except Exception as e:
                 egress_ip = str(e)
 
+            binance_body = ""
             try:
                 session = await self.market._get_session()
                 async with session.get(f"{self.market.base_url}/fapi/v1/ping", timeout=3) as r:
                     binance_ping = f"HTTP {r.status}"
+                    binance_body = await r.text()
             except Exception as e:
                 binance_ping = str(e)
+
+            ws_status = "untested"
+            try:
+                session = await self.market._get_session()
+                async with session.ws_connect("wss://fstream.binance.com/ws/!ticker@arr", timeout=4) as ws:
+                    msg = await asyncio.wait_for(ws.receive_str(), timeout=3)
+                    ws_status = f"OK (received {len(msg)} bytes)"
+            except Exception as e:
+                ws_status = f"WS Error: {e}"
 
             return web.json_response({
                 "status": "ok",
                 "egress_ip": egress_ip,
                 "binance_ping": binance_ping,
+                "binance_body": binance_body,
+                "binance_ws": ws_status,
                 "balance": self.portfolio.balance,
                 "active_positions": list(self.portfolio.active_positions.keys()),
                 "last_scan": self.last_scan_info,
