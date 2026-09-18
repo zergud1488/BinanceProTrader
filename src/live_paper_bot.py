@@ -340,9 +340,9 @@ class LiveMarketEngine:
         if self._session and not self._session.closed:
             await self._session.close()
 
-    async def scan_inplay_candidates(self, min_vol_usd: float = 15_000_000.0, 
-                                     min_range_pct: float = 5.0, 
-                                     top_n: int = 15) -> List[dict]:
+    async def scan_inplay_candidates(self, min_vol_usd: float = 10_000_000.0, 
+                                     min_range_pct: float = 3.5, 
+                                     top_n: int = 30) -> List[dict]:
         """
         Screens 725+ tickers from Binance Futures Mainnet in a single request.
         Ranks by In-Play institutional score (volatility + momentum + volume).
@@ -924,17 +924,17 @@ class LivePaperBot:
 
         # 1. Fast screen of top candidates
         top_coins = await self.market.scan_inplay_candidates(
-            min_vol_usd=15_000_000.0,
-            min_range_pct=5.0,
-            top_n=12
+            min_vol_usd=10_000_000.0,
+            min_range_pct=3.5,
+            top_n=30
         )
         if not top_coins:
             return
 
         # 2. BTC Dump Shield check
         btc_dump = await self.market.check_btc_dump_warning()
-        leaders_str = ", ".join([f"{c['symbol']} ({c['change_24h_pct']:+.1f}%)" for c in top_coins[:4]])
-        print(f"   Screened Leaders: {leaders_str} | BTC Shield: {'DUMP TRIGGERED ⚠️' if btc_dump else 'NORMAL 🟢'}")
+        leaders_str = ", ".join([f"{c['symbol']} ({c['change_24h_pct']:+.1f}%)" for c in top_coins[:6]])
+        print(f"   Screened {len(top_coins)} In-Play Leaders (Top: {leaders_str}) | BTC Shield: {'DUMP TRIGGERED ⚠️' if btc_dump else 'NORMAL 🟢'}")
 
         # 3. Fetch features for candidates concurrently
         eval_tasks = []
