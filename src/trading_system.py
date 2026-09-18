@@ -46,10 +46,9 @@ class UnifiedTradingSystem:
         All checks are strictly causal (zero look-ahead bias).
         """
         # 1. Session Filter: Skip illiquid transition hours (05:00 - 09:00 UTC)
-        # AUDIT NOTE (П7): Grid-search showed that narrowing to 06-08 UTC INCREASES trades to 189
-        # but REDUCES Win Rate to 61.9% and PF to 1.24 vs original 63.6% WR / 1.34 PF.
-        # The original 05-09 window is empirically optimal — Asian session noise is real.
-        hr = row.get("hour_utc", 12)
+        hr = row.get("hour_utc")
+        if hr is None:
+            hr = 12
         if 5 <= hr <= 9:
             return False
 
@@ -117,7 +116,9 @@ class UnifiedTradingSystem:
         Strictly causal, verified through full multi-regime audit (WR 63.7% - 70.2%).
         """
         # 1. Session Filter: Skip illiquid transition hours (05:00 - 09:00 UTC)
-        hr = row.get("hour_utc", 12)
+        hr = row.get("hour_utc")
+        if hr is None:
+            hr = 12
         if 5 <= hr <= 9:
             return False
 

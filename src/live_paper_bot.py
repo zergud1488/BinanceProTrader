@@ -108,7 +108,12 @@ class PaperPortfolio:
                  margin_per_trade: float = 10.0,
                  leverage: float = 20.0,
                  max_concurrent_positions: int = 3,
-                 friction_pct: float = 0.0015):
+                 friction_pct: float = 0.0015,
+                 state_file: Optional[Path] = None,
+                 trades_csv: Optional[Path] = None):
+        self.state_file = state_file or STATE_FILE
+        self.trades_csv = trades_csv or TRADES_CSV
+
         self.starting_balance = starting_balance
         self.balance = starting_balance
         self.margin_per_trade = margin_per_trade
@@ -124,15 +129,15 @@ class PaperPortfolio:
         
         # Active positions: {symbol: dict}
         self.active_positions: Dict[str, dict] = {}
-        # History of completed trades: [dict, ...]
+        # History of completed trades: [dict, ...] (bounded to recent 100 in memory)
         self.closed_trades: List[dict] = []
 
         self._init_csv()
         self.load_state()
 
     def _init_csv(self):
-        if not TRADES_CSV.exists():
-            with open(TRADES_CSV, "w", newline="", encoding="utf-8") as f:
+        if not self.trades_csv.exists():
+            with open(self.trades_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     "trade_id", "symbol", "side", "entry_time", "exit_time", 
@@ -248,13 +253,15 @@ class PaperPortfolio:
         }
 
         self.closed_trades.append(trade_record)
+        if len(self.closed_trades) > 200:
+            self.closed_trades = self.closed_trades[-100:]
         self._log_to_csv(trade_record)
         self.save_state()
         return trade_record
 
     def _log_to_csv(self, t: dict):
         try:
-            with open(TRADES_CSV, "a", newline="", encoding="utf-8") as f:
+            with open(self.trades_csv, "a", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow([
                     t["trade_id"], t["symbol"], t["side"], t["entry_time"], 
@@ -283,19 +290,24 @@ class PaperPortfolio:
             "active_positions": self.active_positions,
             "last_updated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
-        try:
-            temp_file = STATE_FILE.with_suffix(".tmp")
-            with open(temp_file, "w", encoding="utf-8") as f:
-                json.dump(state, f, indent=2, ensure_ascii=False)
-            temp_file.replace(STATE_FILE)
-        except Exception as e:
-            print(f"[!] Error saving portfolio state: {e}")
+        for attempt in range(3):
+            try:
+                temp_file = self.state_file.with_suffix(".tmp")
+                with open(temp_file, "w", encoding="utf-8") as f:
+                    json.dump(state, f, indent=2, ensure_ascii=False)
+                temp_file.replace(self.state_file)
+                return state
+            except Exception as e:
+                if attempt == 2:
+                    print(f"[!] Error saving portfolio state: {e}")
+                time.sleep(0.05)
+        return state
 
     def load_state(self):
-        if not STATE_FILE.exists():
+        if not self.state_file.exists():
             return
         try:
-            with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
+            with open(self.state_file, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             self.starting_balance = data.get("starting_balance", self.starting_balance)
             self.balance = data.get("balance", self.balance)
