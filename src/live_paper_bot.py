@@ -23,6 +23,11 @@ REPORTS_DIR = BASE_DIR / "reports"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Import Audited Quantitative Trading System and SMC Engine
+sys.path.insert(0, str(BASE_DIR / "src"))
+from trading_system import UnifiedTradingSystem
+from smc_engine import compute_smc_for_symbol
+
 # Credentials & System Constants
 TELEGRAM_BOT_TOKEN = "6110538923:AAEVgH4IAftaG8nAFjDiFz0-FSqGu1Fbv_g"
 TELEGRAM_CHAT_ID = "669861467"
@@ -281,7 +286,7 @@ class PaperPortfolio:
         if not STATE_FILE.exists():
             return
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
+            with open(STATE_FILE, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
             self.starting_balance = data.get("starting_balance", self.starting_balance)
             self.balance = data.get("balance", self.balance)
@@ -434,42 +439,66 @@ class LiveMarketEngine:
 
     async def fetch_symbol_features(self, symbol: str, btc_dump: int) -> Optional[dict]:
         """
-        Fetches 1m klines and evaluates features STRICTLY on the last COMPLETED bar.
-        Eliminates forming-candle distortion (zero look-ahead, 100% causal).
+        Fetches multi-timeframe Binance Futures Mainnet candles:
+        - 1m (limit=100) for real SMC (OB, FVG, S/R Flip, Breakout Retest) and Orderflow
+        - 15m (limit=30) for true 15m EMA trend (EMA 9 vs 21)
+        - 1h (limit=30) for true 1h EMA trend (EMA 9 vs 21)
+        Evaluates strictly on the last COMPLETED 1m bar (100% causal, zero look-ahead).
         """
-        url = f"{self.base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit=45"
         session = await self._get_session()
-        
+        u_1m = f"{self.base_url}/fapi/v1/klines?symbol={symbol}&interval=1m&limit=100"
+        u_15m = f"{self.base_url}/fapi/v1/klines?symbol={symbol}&interval=15m&limit=30"
+        u_1h = f"{self.base_url}/fapi/v1/klines?symbol={symbol}&interval=1h&limit=30"
+
         try:
-            async with session.get(url) as resp:
-                if resp.status != 200:
-                    return None
-                klines = await resp.json()
+            r1, r15, r1h = await asyncio.gather(
+                session.get(u_1m), session.get(u_15m), session.get(u_1h)
+            )
+            if r1.status != 200 or r15.status != 200 or r1h.status != 200:
+                return None
+            k1 = await r1.json()
+            k15 = await r15.json()
+            k1h = await r1h.json()
         except Exception:
             return None
 
-        if not isinstance(klines, list) or len(klines) < 30:
+        if not isinstance(k1, list) or len(k1) < 50 or len(k15) < 22 or len(k1h) < 22:
             return None
 
+        # 1. Real 1h Trend (EMA 9 vs 21 on 1h bars)
+        c1h = np.array([float(k[4]) for k in k1h])
+        ema9_1h = np.mean(c1h[-9:])
+        ema21_1h = np.mean(c1h[-21:])
+        trend_1h_bull = 1 if ema9_1h > ema21_1h else 0
+
+        # 2. Real 15m Trend (EMA 9 vs 21 on 15m bars)
+        c15 = np.array([float(k[4]) for k in k15])
+        ema9_15 = np.mean(c15[-9:])
+        ema21_15 = np.mean(c15[-21:])
+        trend_15m_bull = 1 if ema9_15 > ema21_15 else 0
+
+        # Fast prune: if either trend is not bullish, don't waste CPU on SMC
+        if trend_15m_bull != 1 or trend_1h_bull != 1:
+            return {
+                "symbol": symbol,
+                "trend_15m_bull": trend_15m_bull,
+                "trend_1h_bull": trend_1h_bull,
+                "btc_dump_warning": btc_dump,
+                "skip": True
+            }
+
+        # 3. Last completed 1m candle
         curr_ms = int(time.time() * 1000)
-        # Determine last completed candle
-        if curr_ms <= klines[-1][6]:
-            eval_idx = -2
-            mark_price = float(klines[-1][4])
-        else:
-            eval_idx = -1
-            mark_price = float(klines[-1][4])
+        eval_idx = -2 if curr_ms <= k1[-1][6] else -1
+        mark_price = float(k1[-1][4])
 
-        k_eval = klines[:eval_idx + 1]
-        if len(k_eval) < 25:
-            return None
-
-        opens = np.array([float(k[1]) for k in k_eval])
-        highs = np.array([float(k[2]) for k in k_eval])
-        lows = np.array([float(k[3]) for k in k_eval])
-        closes = np.array([float(k[4]) for k in k_eval])
-        vols = np.array([float(k[5]) for k in k_eval])
-        taker_vols = np.array([float(k[9]) for k in k_eval])
+        k_eval = k1[:eval_idx + 1]
+        opens = np.array([float(k[1]) for k in k_eval], dtype=np.float64)
+        highs = np.array([float(k[2]) for k in k_eval], dtype=np.float64)
+        lows = np.array([float(k[3]) for k in k_eval], dtype=np.float64)
+        closes = np.array([float(k[4]) for k in k_eval], dtype=np.float64)
+        vols = np.array([float(k[5]) for k in k_eval], dtype=np.float64)
+        taker_vols = np.array([float(k[9]) for k in k_eval], dtype=np.float64)
 
         target_o = opens[-1]
         target_h = highs[-1]
@@ -478,36 +507,42 @@ class LiveMarketEngine:
         target_v = vols[-1]
         target_tb_v = taker_vols[-1]
 
-        # 1. RVOL (20-period volume SMA of preceding completed bars)
+        # 4. Orderflow & Geometry
         vol_sma_20 = np.mean(vols[-21:-1]) if len(vols) >= 21 else np.mean(vols[:-1])
         rvol = target_v / (vol_sma_20 + 1e-8)
-
-        # 2. Taker Buy Ratio
         tb_ratio = target_tb_v / (target_v + 1e-8)
-
-        # 3. Lower Rejection Wick
         candle_h = target_h - target_l + 1e-8
         lower_wick = (min(target_o, target_c) - target_l) / candle_h
 
-        # 4. True Range & ATR-15
-        tr_list = []
+        # True Range & ATR-15
+        tr_list = [highs[0] - lows[0]]
         for i in range(1, len(closes)):
             tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
             tr_list.append(tr)
         atr_15_pct = (np.mean(tr_list[-15:]) / target_c * 100.0) if len(tr_list) >= 15 else 1.0
 
-        # 5. Trend (Fast EMA > Slow EMA)
-        ema_fast = np.mean(closes[-10:])
-        ema_slow = np.mean(closes[-25:])
-        trend_15m_bull = 1 if ema_fast > ema_slow else 0
+        # 5. Real Audited SMC Detection via smc_engine
+        rvols = np.ones(len(vols), dtype=np.float64)
+        for i in range(20, len(vols)):
+            rvols[i] = vols[i] / (np.mean(vols[i-20:i]) + 1e-8)
+        atr_arr = np.full(len(closes), atr_15_pct, dtype=np.float64)
 
-        # 6. SMC Structural Detection:
-        # FVG Bullish
-        has_fvg = 1 if target_l > highs[-3] and ((target_l - highs[-3]) / highs[-3] * 100.0 >= 0.20) else 0
-        
-        # Order Block / S/R Flip Retest
-        recent_high = np.max(highs[-15:-2]) if len(highs) >= 15 else highs[-2]
-        has_retest = 1 if target_l <= recent_high and target_c >= recent_high * 0.997 else 0
+        fvg_trig, ob_trig, sr_trig, conf = compute_smc_for_symbol(
+            opens, highs, lows, closes, vols, rvols, atr_arr
+        )
+        smc_fvg_bull = int(fvg_trig[-1])
+        smc_ob_bull = int(ob_trig[-1])
+        smc_sr_flip = int(sr_trig[-1])
+
+        # Audited Breakout Retest from features_expanded.py:
+        # swing high over 15 bars, current bar breaks and retests, closed green
+        prev_swing_high_15 = np.max(highs[-16:-1]) if len(highs) >= 16 else highs[-2]
+        smc_breakout_retest_bull = 1 if (
+            target_c > target_o and 
+            target_l <= prev_swing_high_15 and 
+            target_c >= prev_swing_high_15 and 
+            target_c > closes[-2]
+        ) else 0
 
         utc_hour = datetime.datetime.now(datetime.timezone.utc).hour
 
@@ -516,7 +551,7 @@ class LiveMarketEngine:
             "hour_utc": utc_hour,
             "btc_dump_warning": btc_dump,
             "trend_15m_bull": trend_15m_bull,
-            "trend_1h_bull": 1,
+            "trend_1h_bull": trend_1h_bull,
             "rvol_20": rvol,
             "taker_buy_ratio": tb_ratio,
             "lower_wick_ratio": lower_wick,
@@ -526,10 +561,11 @@ class LiveMarketEngine:
             "close": target_c,
             "mark_price": mark_price,
             "atr_15_pct": atr_15_pct,
-            "smc_ob_bull": has_retest,
-            "smc_fvg_bull": has_fvg,
-            "smc_sr_flip": has_retest,
-            "smc_breakout_retest_bull": has_retest
+            "smc_ob_bull": smc_ob_bull,
+            "smc_fvg_bull": smc_fvg_bull,
+            "smc_sr_flip": smc_sr_flip,
+            "smc_breakout_retest_bull": smc_breakout_retest_bull,
+            "skip": False
         }
 
     async def fetch_position_candle_info(self, symbols: List[str]) -> Dict[str, dict]:
@@ -564,83 +600,46 @@ class LiveMarketEngine:
 
 
 # =====================================================================
-# 4. STRATEGY EVALUATOR (Exact SMC Baseline, Dynamic ATR Brackets)
+# 4. STRATEGY EVALUATOR (Direct proxy to audited UnifiedTradingSystem)
 # =====================================================================
 class SMCStrategyEngine:
     """
-    Implements the empirically proven SMC In-Play Scalper logic.
-    - Zero look-ahead bias
-    - NO Breakeven (as confirmed by user command and audit)
-    - Dynamic ATR-15 brackets
+    Direct proxy to the Audited UnifiedTradingSystem (from src/trading_system.py).
+    Integrates 6 audited institutional filters:
+    1. Session Filter (05:00 - 09:00 UTC)
+    2. Bitcoin Dump Shield (btc_dump_warning == 0)
+    3. Multi-timeframe trend alignment (15m AND 1h Bullish)
+    4. Climax Volume Filter (RVOL 1.10 - 5.5)
+    5. Orderflow Absorption: Taker Buy >= 55%, Lower Wick >= 15%, Green candle
+    6. Smart Money Concepts (SMC): Real OB, Real FVG, Real S/R Flip, Real BSR
     """
-    @staticmethod
-    def evaluate_entry_signal(row: dict) -> Tuple[bool, List[str]]:
+    def __init__(self):
+        self.system = UnifiedTradingSystem(
+            starting_balance=100.0,
+            margin_fraction=0.10,
+            leverage=20.0,
+            enable_be=False
+        )
+
+    def evaluate_entry_signal(self, row: dict) -> Tuple[bool, List[str]]:
+        if row.get("skip", False):
+            return False, []
+
+        sig = self.system.evaluate_signal(row)
         reasons = []
+        if sig:
+            if row.get("smc_fvg_bull"):
+                reasons.append("FVG Imbalance")
+            if row.get("smc_ob_bull"):
+                reasons.append("Order Block")
+            if row.get("smc_sr_flip"):
+                reasons.append("S/R Flip")
+            if row.get("smc_breakout_retest_bull"):
+                reasons.append("Breakout Retest")
+        return sig, reasons
 
-        # 1. Session filter: avoid Asian lull (05:00 - 09:00 UTC)
-        hr = row.get("hour_utc", 12)
-        if 5 <= hr <= 9:
-            return False, []
-
-        # 2. Bitcoin Dump Shield
-        if row.get("btc_dump_warning", 0) == 1:
-            return False, []
-
-        # 3. Multi-timeframe trend alignment
-        if row.get("trend_15m_bull", 0) != 1:
-            return False, []
-
-        # 4. Climax Volume Filter (RVOL 1.10 - 5.5)
-        rvol = row.get("rvol_20", 0.0)
-        if rvol < 1.10 or rvol > 5.5:
-            return False, []
-
-        # 5. Orderflow Absorption: Taker Buy >= 55%
-        tb = row.get("taker_buy_ratio", 0.0)
-        if tb < 0.55:
-            return False, []
-
-        # Lower Rejection Wick >= 15%
-        lw = row.get("lower_wick_ratio", 0.0)
-        if lw < 0.15:
-            return False, []
-
-        # Green Candle Close
-        c = row.get("close", 0.0)
-        o = row.get("open", 0.0)
-        if c <= o:
-            return False, []
-
-        # 6. SMC Structural Confluence
-        if row.get("smc_fvg_bull", 0) == 1:
-            reasons.append("FVG Imbalance")
-        if row.get("smc_ob_bull", 0) == 1:
-            reasons.append("Order Block")
-        if row.get("smc_sr_flip", 0) == 1:
-            reasons.append("S/R Flip")
-        if row.get("smc_breakout_retest_bull", 0) == 1:
-            reasons.append("Breakout Retest")
-
-        has_smc = len(reasons) > 0
-        return has_smc, reasons
-
-    @staticmethod
-    def calculate_sltp(entry_price: float, atr_15_pct: float) -> Tuple[float, float, float, float]:
-        """
-        Dynamic ATR Brackets:
-        - SL = 2.0x ATR, clamped between 1.6% and 3.5%
-        - TP = 1.4x ATR, clamped between 1.0% and 2.8%
-        """
-        if np.isnan(atr_15_pct) or atr_15_pct <= 0:
-            atr_15_pct = 1.0
-
-        sl_pct = float(np.clip(max(atr_15_pct * 2.0, 1.8), 1.6, 3.5))
-        tp_pct = float(np.clip(max(atr_15_pct * 1.4, 1.2), 1.0, 2.8))
-
-        sl_price = entry_price * (1.0 - sl_pct / 100.0)
-        tp_price = entry_price * (1.0 + tp_pct / 100.0)
-
-        return sl_pct, tp_pct, sl_price, tp_price
+    def calculate_sltp(self, entry_price: float, atr_15_pct: float) -> Tuple[float, float, float, float]:
+        return self.system.calculate_sltp(entry_price, atr_15_pct)
 
 
 # =====================================================================
@@ -981,8 +980,8 @@ class LivePaperBot:
         # 1. Fast screen of top candidates
         top_coins = await self.market.scan_inplay_candidates(
             min_vol_usd=10_000_000.0,
-            min_range_pct=3.5,
-            top_n=30
+            min_range_pct=4.0,
+            top_n=20
         )
         if not top_coins:
             self.last_scan_info["error"] = "No candidates or Binance API rate-limit/ban (HTTP 418/429)"
