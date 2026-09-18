@@ -1061,6 +1061,13 @@ class LivePaperBot:
         Never exits unexpectedly on network glitches.
         """
         self.is_running = True
+        if os.environ.get("STANDBY_MODE") == "1":
+            print("[*] Running in STANDBY / DASHBOARD mode on Render (Trading executed on Local PC)")
+            await self.start_web_server()
+            while self.is_running:
+                await asyncio.sleep(3600)
+            return
+
         await self.initialize()
 
         last_scan_time = 0.0
